@@ -1,0 +1,70 @@
+version: "3.9"
+
+# WHY DOCKER COMPOSE: this project needs 4 separate running processes
+# (database, cache/broker, backend API, frontend) that all need to talk to
+# each other. Compose lets us define all 4 in one file and start the whole
+# stack with a single command: `docker compose up`.
+
+services:
+
+  # --- MySQL: the primary data store (Database Design requirement) ---
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${DB_NAME:-cloud_dedup_db}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql                         # persists data across restarts
+      - ../Database/schema.sql:/docker-entrypoint-initdb.d/schema.sql  # auto-runs on first startup
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Redis: caching + Celery message broker + rate-limit storage ---
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # --- Backend: the Flask REST API ---
+  backend:
+    build:
+      context: ../Backend
+      dockerfile: ../Docker/Dockerfile.backend
+    restart: unless-stopped
+    env_file:
+      - ../Backend/.env
+    environment:
+      DB_HOST: mysql        # inside the Docker network, containers reach each
+      REDIS_URL: redis://redis:6379/0   # other by SERVICE NAME, not localhost
+      RATELIMIT_STORAGE_URI: redis://redis:6379/1
+    ports:
+      - "5000:5000"
+    volumes:
+      - backend_storage:/app/storage    # uploaded files survive container restarts
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # --- Frontend: the React SPA, served via nginx ---
+  frontend:
+    build:
+      context: ../Frontend
+      dockerfile: ../Docker/Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:
+  backend_storage:
